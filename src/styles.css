@@ -1,0 +1,357 @@
+import { useEffect, useMemo, useRef, useState } from 'react';
+
+const SOUND_PRESETS = {
+  classic: { label: 'Classic Bell', sequence: [880, 659, 880, 523], interval: 500 },
+  chime: { label: 'Chime', sequence: [659, 784, 1046], interval: 700 },
+  buzz: { label: 'Buzz', sequence: [220, 220, 220], interval: 250 },
+  soft: { label: 'Soft Tone', sequence: [392, 523, 659], interval: 800 },
+};
+
+const STORAGE_KEYS = {
+  alarms: 'alarm-app-alarms',
+  theme: 'alarm-app-theme',
+};
+
+const getDefaultTime = () => {
+  const now = new Date();
+  const nextMin = new Date(now.getTime() + 10 * 60000);
+  return `${String(nextMin.getHours()).padStart(2, '0')}:${String(nextMin.getMinutes()).padStart(2, '0')}`;
+};
+
+const timeToLabel = (value) => {
+  if (!value) return '';
+  const [hourText, minuteText] = value.split(':');
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const suffix = hour >= 12 ? 'PM' : 'AM';
+  const displayHour = hour % 12 || 12;
+  return `${displayHour}:${String(minute).padStart(2, '0')} ${suffix}`;
+};
+
+const formatCurrentTime = (date) => {
+  return new Intl.DateTimeFormat('en-US', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(date);
+};
+
+const createAlarmId = () => `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+const initialAlarms = () => {
+  const saved = localStorage.getItem(STORAGE_KEYS.alarms);
+  if (!saved) return [];
+
+  try {
+    const parsed = JSON.parse(saved);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+};
+
+function App() {
+  const [theme, setTheme] = useState(() => {
+    const saved = localStorage.getItem(STORAGE_KEYS.theme);
+    return saved || 'dark';
+  });
+  const [alarms, setAlarms] = useState(initialAlarms);
+  const [timeValue, setTimeValue] = useState(getDefaultTime());
+  const [selectedSound, setSelectedSound] = useState('classic');
+  const [currentTime, setCurrentTime] = useState(new Date());
+  const [ringingAlarmId, setRingingAlarmId] = useState(null);
+  const [notificationPermissionRequested, setNotificationPermissionRequested] = useState(false);
+
+  const audioContextRef = useRef(null);
+  const alarmIntervalRef = useRef(null);
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme);
+    localStorage.setItem(STORAGE_KEYS.theme, theme);
+  }, [theme]);
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEYS.alarms, JSON.stringify(alarms));
+  }, [alarms]);
+
+  useEffect(() => {
+    const timer = setInterval(() => setCurrentTime(new Date()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    if (!('Notification' in window) || notificationPermissionRequested) return;
+
+    if (Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+
+    setNotificationPermissionRequested(true);
+  }, [notificationPermissionRequested]);
+
+  const startTone = (frequency = 880, duration = 0.22) => {
+    try {
+      const AudioCtor = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtor) return;
+
+      if (!audioContextRef.current) {
+        audioContextRef.current = new AudioCtor();
+      }
+
+      const audioContext = audioContextRef.current;
+      if (audioContext.state === 'suspended') {
+        audioContext.resume();
+      }
+
+      const oscillator = audioContext.createOscillator();
+      const gain = audioContext.createGain();
+      oscillator.type = 'sine';
+      oscillator.frequency.value = frequency;
+      gain.gain.value = 0.05;
+      oscillator.connect(gain);
+      gain.connect(audioContext.destination);
+      oscillator.start();
+      oscillator.stop(audioContext.currentTime + duration);
+    } catch (error) {
+      console.warn('Audio playback was blocked:', error);
+    }
+  };
+
+  const stopAudio = () => {
+    if (alarmIntervalRef.current) {
+      clearInterval(alarmIntervalRef.current);
+      alarmIntervalRef.current = null;
+    }
+
+    if (audioContextRef.current) {
+      audioContextRef.current.close();
+      audioContextRef.current = null;
+    }
+  };
+
+  const ringAlarm = (alarm) => {
+    if (!alarm) return;
+
+    const pattern = SOUND_PRESETS[alarm.sound]?.sequence || SOUND_PRESETS.classic.sequence;
+    let step = 0;
+
+    alarmIntervalRef.current = setInterval(() => {
+      startTone(pattern[step % pattern.length], 0.25);
+      step += 1;
+    }, SOUND_PRESETS[alarm.sound]?.interval || 500);
+
+    if ('Notification' in window && Notification.permission === 'granted') {
+      new Notification('Alarm ringing', {
+        body: `${timeToLabel(alarm.time)} · ${SOUND_PRESETS[alarm.sound]?.label || 'Classic Bell'}`,
+      });
+    }
+  };
+
+  useEffect(() => {
+    if (!ringingAlarmId) return;
+
+    const activeAlarm = alarms.find((alarm) => alarm.id === ringingAlarmId);
+    if (!activeAlarm) return;
+
+    ringAlarm(activeAlarm);
+
+    return () => {
+      if (alarmIntervalRef.current) {
+        clearInterval(alarmIntervalRef.current);
+        alarmIntervalRef.current = null;
+      }
+    };
+  }, [ringingAlarmId]);
+
+  useEffect(() => {
+    const currentTimeValue = `${String(currentTime.getHours()).padStart(2, '0')}:${String(currentTime.getMinutes()).padStart(2, '0')}`;
+
+    const activeAlarm = alarms.find(
+      (alarm) =>
+        alarm.enabled &&
+        alarm.time === currentTimeValue &&
+        !ringingAlarmId
+    );
+
+    if (activeAlarm) {
+      setRingingAlarmId(activeAlarm.id);
+    }
+  }, [currentTime, alarms, ringingAlarmId]);
+
+  const addAlarm = () => {
+    if (!timeValue) return;
+
+    const exists = alarms.some((alarm) => alarm.time === timeValue);
+    if (exists) {
+      alert('An alarm for this time already exists.');
+      return;
+    }
+
+    const newAlarm = {
+      id: createAlarmId(),
+      time: timeValue,
+      enabled: true,
+      sound: selectedSound,
+    };
+
+    setAlarms((prev) => [newAlarm, ...prev]);
+    setTimeValue(getDefaultTime());
+  };
+
+  const toggleAlarm = (alarmId) => {
+    setAlarms((prev) =>
+      prev.map((alarm) =>
+        alarm.id === alarmId ? { ...alarm, enabled: !alarm.enabled } : alarm
+      )
+    );
+
+    if (ringingAlarmId === alarmId) {
+      stopAlarm(false);
+    }
+  };
+
+  const removeAlarm = (alarmId) => {
+    setAlarms((prev) => prev.filter((alarm) => alarm.id !== alarmId));
+
+    if (ringingAlarmId === alarmId) {
+      stopAlarm(false);
+    }
+  };
+
+  const stopAlarm = (shouldPersist = true) => {
+    stopAudio();
+
+    if (shouldPersist && ringingAlarmId) {
+      setAlarms((prev) =>
+        prev.map((alarm) =>
+          alarm.id === ringingAlarmId ? { ...alarm, enabled: false } : alarm
+        )
+      );
+    }
+
+    setRingingAlarmId(null);
+  };
+
+  const snoozeAlarm = () => {
+    if (!ringingAlarmId) return;
+
+    const target = alarms.find((alarm) => alarm.id === ringingAlarmId);
+    if (!target) return;
+
+    const future = new Date();
+    future.setMinutes(future.getMinutes() + 5);
+    const snoozedTime = `${String(future.getHours()).padStart(2, '0')}:${String(future.getMinutes()).padStart(2, '0')}`;
+
+    setAlarms((prev) =>
+      prev.map((alarm) =>
+        alarm.id === ringingAlarmId ? { ...alarm, time: snoozedTime, enabled: true } : alarm
+      )
+    );
+
+    stopAlarm(false);
+  };
+
+  const activeAlarm = useMemo(
+    () => alarms.find((alarm) => alarm.id === ringingAlarmId) || null,
+    [alarms, ringingAlarmId]
+  );
+
+  return (
+    <div className="app-shell">
+      <div className="app-card">
+        <header className="topbar">
+          <div>
+            <p className="eyebrow">Smart Clock</p>
+            <h1>Alarm App</h1>
+          </div>
+
+          <button
+            className="theme-toggle"
+            type="button"
+            onClick={() => setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'))}
+            aria-label="Toggle theme"
+          >
+            {theme === 'dark' ? '☀️' : '🌙'}
+          </button>
+        </header>
+
+        <div className="clock-display">{formatCurrentTime(currentTime)}</div>
+
+        <div className="alarm-form">
+          <input
+            type="time"
+            value={timeValue}
+            onChange={(event) => setTimeValue(event.target.value)}
+            aria-label="Alarm time"
+          />
+
+          <select
+            value={selectedSound}
+            onChange={(event) => setSelectedSound(event.target.value)}
+            aria-label="Alarm sound"
+          >
+            {Object.entries(SOUND_PRESETS).map(([key, sound]) => (
+              <option key={key} value={key}>
+                {sound.label}
+              </option>
+            ))}
+          </select>
+
+          <button type="button" className="primary-btn" onClick={addAlarm}>
+            Add Alarm
+          </button>
+        </div>
+
+        <div className="alarm-list">
+          {alarms.length === 0 ? (
+            <p className="empty-state">No alarms set yet</p>
+          ) : (
+            alarms.map((alarm) => (
+              <div key={alarm.id} className={`alarm-item ${ringingAlarmId === alarm.id ? 'ringing' : ''}`}>
+                <div className="alarm-meta">
+                  <strong>{timeToLabel(alarm.time)}</strong>
+                  <span>{SOUND_PRESETS[alarm.sound]?.label || 'Classic Bell'}</span>
+                </div>
+
+                <div className="alarm-actions">
+                  <button
+                    type="button"
+                    className={`toggle-btn ${alarm.enabled ? 'enabled' : 'disabled'}`}
+                    onClick={() => toggleAlarm(alarm.id)}
+                  >
+                    {alarm.enabled ? 'On' : 'Off'}
+                  </button>
+                  <button type="button" className="delete-btn" onClick={() => removeAlarm(alarm.id)}>
+                    Delete
+                  </button>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+
+      {activeAlarm && (
+        <div className="ringing-modal" role="dialog" aria-modal="true">
+          <div className="ringing-panel">
+            <p className="ringing-label">Alarm is ringing</p>
+            <h2>{timeToLabel(activeAlarm.time)}</h2>
+            <p>{SOUND_PRESETS[activeAlarm.sound]?.label || 'Classic Bell'}</p>
+
+            <div className="ringing-actions">
+              <button type="button" className="primary-btn" onClick={() => stopAlarm(true)}>
+                Stop
+              </button>
+              <button type="button" className="secondary-btn" onClick={snoozeAlarm}>
+                Snooze 5m
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default App;
